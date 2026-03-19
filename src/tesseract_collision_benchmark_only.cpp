@@ -38,6 +38,7 @@
 #include <tesseract/common/stopwatch.h>
 #include <tesseract_collision_benchmark/types.h>
 #include <tesseract/collision/discrete_contact_manager.h>
+#include <tesseract/collision/continuous_contact_manager.h>
 #include <tesseract/state_solver/state_solver.h>
 #include <tesseract/scene_graph/graph.h>
 #include <tesseract/scene_graph/scene_state.h>
@@ -301,6 +302,78 @@ void runTesseractCollisionDetection(std::ostream& csv_stream,
                              contact_count);
 }
 
+/** \brief Runs a continuous collision detection benchmark and measures the time.
+*
+*   \param name Name to give the benchmark
+*   \param trials The number of repeated collision checks for each state pair
+*   \param checker Tesseract continuous contact checker
+*   \param state_pairs A vector of start/end collision object transform pairs
+*   \param test_type The tesseract contact test type (FIRST, ALL, CLOSEST)
+*   \param distance Turn on distance
+*   \param penetration Turn on penetration */
+void runTesseractContinuousCollisionDetection(
+    std::ostream& csv_stream,
+    const std::string& name,
+    const std::string& scenario,
+    unsigned int trials,
+    tesseract::collision::ContinuousContactManager& checker,
+    const std::vector<std::pair<tesseract::common::TransformMap,
+                                tesseract::common::TransformMap>>& state_pairs,
+    const std::vector<std::string>& active_links,
+    tesseract::collision::ContactTestType test_type,
+    bool distance = false,
+    bool penetration = false)
+{
+    std::string ct = tesseract::collision::ContactTestTypeStrings.at(static_cast<std::size_t>(test_type));
+    std::string desc = name + "(" + ct + ")";
+
+    tesseract::collision::ContactResultMap res;
+    tesseract::collision::ContactRequest req(test_type);
+    req.calculate_distance = distance;
+    req.calculate_penetration = penetration;
+
+    tesseract::common::Stopwatch stopwatch;
+    stopwatch.start();
+    for (const auto& [pose1, pose2] : state_pairs)
+    {
+        // Active links get cast (moving) transforms; others get static transforms
+        for (const auto& tf : pose1)
+        {
+            if (std::find(active_links.begin(), active_links.end(), tf.first) != active_links.end())
+                checker.setCollisionObjectsTransform(tf.first, tf.second, pose2.at(tf.first));
+            else
+                checker.setCollisionObjectsTransform(tf.first, tf.second);
+        }
+        for (unsigned int i = 0; i < trials; ++i)
+        {
+            res.clear();
+            checker.contactTest(res, req);
+        }
+    }
+    stopwatch.stop();
+    const double duration = stopwatch.elapsedSeconds();
+
+    const double checks_per_second = static_cast<double>(trials * state_pairs.size()) / duration;
+    const std::size_t total_num_checks = trials * state_pairs.size();
+
+    std::size_t contact_count = 0;
+    for (const auto& c : res)
+        contact_count += c.second.size();
+
+    csv_stream << std::quoted(scenario) << ","
+               << std::quoted(name) << ","
+               << std::quoted(ct) << ","
+               << checks_per_second << ","
+               << total_num_checks << ","
+               << contact_count << "\n";
+
+    CONSOLE_BRIDGE_logInform("%-40s | %17.0f | %16zu | %12zu",
+                             desc.c_str(),
+                             checks_per_second,
+                             total_num_checks,
+                             contact_count);
+}
+
 int main(int argc, char** argv)
 {
     console_bridge::setLogLevel(console_bridge::LogLevel::CONSOLE_BRIDGE_LOG_INFO);
@@ -308,8 +381,34 @@ int main(int argc, char** argv)
     const unsigned int num_states = 50;
 
     std::string csv_path = "tesseract_collision_benchmark.csv";
-    if (argc > 1)
-        csv_path = argv[1];
+    std::string mode = "both";
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if ((std::string(argv[i]) == "--mode" || std::string(argv[i]) == "-m") && i + 1 < argc)
+        {
+            mode = argv[++i];
+            if (mode != "discrete" && mode != "continuous" && mode != "both")
+            {
+                CONSOLE_BRIDGE_logError("Invalid mode '%s'. Use: discrete, continuous, or both", mode.c_str());
+                return 1;
+            }
+        }
+        else if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h")
+        {
+            std::cout << "Usage: " << argv[0] << " [CSV_PATH] [--mode discrete|continuous|both]\n"
+                      << "  CSV_PATH   Output CSV file (default: tesseract_collision_benchmark.csv)\n"
+                      << "  --mode/-m  Benchmark mode: discrete, continuous, or both (default: both)\n";
+            return 0;
+        }
+        else if (argv[i][0] != '-')
+        {
+            csv_path = argv[i];
+        }
+    }
+
+    const bool run_discrete = (mode == "discrete" || mode == "both");
+    const bool run_continuous = (mode == "continuous" || mode == "both");
 
     std::ofstream csv_file(csv_path);
     if (!csv_file.is_open())
@@ -374,8 +473,14 @@ int main(int argc, char** argv)
     csv_file << "scenario,manager,mode,checks_per_second,total_num_checks,num_contacts\n";
 
     std::ostringstream scenario;
+
+    // ************************************************
+    // DISCRETE COLLISION BENCHMARKS
+    // ************************************************
+    if (run_discrete)
+    {
     scenario << "Contact Only, " << states_in_collision << " out of " << t_sampled_states.size() << " states in collision";
-        
+
     CONSOLE_BRIDGE_logInform("Starting scenario: %s", scenario.str().c_str());
     CONSOLE_BRIDGE_logInform("%-40s | %17s | %16s | %12s", "Description", "Checks Per Second", "Total Num Checks", "Num Contacts");
     CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
@@ -439,6 +544,104 @@ int main(int argc, char** argv)
         runTesseractCollisionDetection(csv_file, contact_checker->getName(), scenario.str(), trials, *contact_checker, t_sampled_states, tesseract::collision::ContactTestType::ALL, true, true, is_physx);
     }
     CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+    } // run_discrete
+
+    // ************************************************
+    // CONTINUOUS COLLISION BENCHMARKS
+    // ************************************************
+    if (run_continuous)
+    {
+    std::vector<tesseract::collision::ContinuousContactManager::UPtr> cast_checkers;
+    cast_checkers.push_back(tesseract_env.getContinuousContactManager("BulletCastBVHManager"));
+    cast_checkers.push_back(tesseract_env.getContinuousContactManager("CoalCastBVHManager"));
+
+    for (auto& checker : cast_checkers)
+    {
+        checker->addCollisionObject("world", 0, shapes, shape_poses);
+        checker->setDefaultCollisionMargin(0);
+        checker->setActiveCollisionObjects(link_names);
+    }
+
+    // Build state pairs from consecutive sampled states
+    std::vector<std::pair<tesseract::common::TransformMap,
+                          tesseract::common::TransformMap>> state_pairs;
+    for (std::size_t i = 0; i + 1 < t_sampled_states.size(); ++i)
+        state_pairs.emplace_back(t_sampled_states[i], t_sampled_states[i + 1]);
+
+    CONSOLE_BRIDGE_logInform("Starting continuous collision benchmarks with %zu state pairs", state_pairs.size());
+
+    sleep(1);
+
+    // Scenario 1: Continuous Contact Only
+    for (auto& checker : cast_checkers)
+        checker->setDefaultCollisionMargin(0);
+
+    scenario.str("");
+    scenario << "Continuous: Contact Only, " << state_pairs.size() << " state pairs";
+
+    CONSOLE_BRIDGE_logInform("Starting scenario: %s", scenario.str().c_str());
+    CONSOLE_BRIDGE_logInform("%-40s | %17s | %16s | %12s", "Description", "Checks Per Second", "Total Num Checks", "Num Contacts");
+    CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+
+    for (auto& checker : cast_checkers)
+    {
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::FIRST);
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::CLOSEST);
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::ALL);
+    }
+    CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+
+    // Scenario 2: Continuous Penetration Enabled
+    scenario.str("");
+    scenario << "Continuous: Penetration Enabled, " << state_pairs.size() << " state pairs";
+
+    CONSOLE_BRIDGE_logInform("Starting scenario: %s", scenario.str().c_str());
+    CONSOLE_BRIDGE_logInform("%-40s | %17s | %16s | %12s", "Description", "Checks Per Second", "Total Num Checks", "Num Contacts");
+    CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+
+    for (auto& checker : cast_checkers)
+    {
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::FIRST, false, true);
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::CLOSEST, false, true);
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::ALL, false, true);
+    }
+    CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+
+    // Scenario 3: Continuous Distance (0.2 m) Enabled
+    for (auto& checker : cast_checkers)
+        checker->setDefaultCollisionMargin(0.2);
+
+    scenario.str("");
+    scenario << "Continuous: Distance (0.2 m) Enabled, " << state_pairs.size() << " state pairs";
+
+    CONSOLE_BRIDGE_logInform("Starting scenario: %s", scenario.str().c_str());
+    CONSOLE_BRIDGE_logInform("%-40s | %17s | %16s | %12s", "Description", "Checks Per Second", "Total Num Checks", "Num Contacts");
+    CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+
+    for (auto& checker : cast_checkers)
+    {
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::FIRST, true);
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::CLOSEST, true);
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::ALL, true);
+    }
+    CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+
+    // Scenario 4: Continuous Distance (0.2 m) and Penetration Enabled
+    scenario.str("");
+    scenario << "Continuous: Distance (0.2 m) and Penetration Enabled, " << state_pairs.size() << " state pairs";
+
+    CONSOLE_BRIDGE_logInform("Starting scenario: %s", scenario.str().c_str());
+    CONSOLE_BRIDGE_logInform("%-40s | %17s | %16s | %12s", "Description", "Checks Per Second", "Total Num Checks", "Num Contacts");
+    CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+
+    for (auto& checker : cast_checkers)
+    {
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::FIRST, true, true);
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::CLOSEST, true, true);
+        runTesseractContinuousCollisionDetection(csv_file, checker->getName(), scenario.str(), trials, *checker, state_pairs, link_names, tesseract::collision::ContactTestType::ALL, true, true);
+    }
+    CONSOLE_BRIDGE_logInform("-----------------------------------------+-------------------+------------------+-------------");
+    } // run_continuous
 
     CONSOLE_BRIDGE_logInform("CSV results written to %s", csv_path.c_str());
 
