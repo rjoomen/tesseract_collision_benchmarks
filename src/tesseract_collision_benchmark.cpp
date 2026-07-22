@@ -41,6 +41,7 @@
 #include <moveit/utils/robot_model_test_utils.h>
 #include <tesseract/common/resource_locator.h>
 #include <tesseract/common/stopwatch.h>
+#include <tesseract/common/types.h>
 #include <tesseract_collision_benchmark/types.h>
 #include <tesseract/collision/discrete_contact_manager.h>
 #include <tesseract/state_solver/state_solver.h>
@@ -519,8 +520,9 @@ int main(int /*argc*/, char** /*argv*/)
     auto t_env_state = tesseract_state_solver->getState(
         current_state.getVariableNames(),
         Eigen::Map<Eigen::VectorXd>(s.getVariablePositions(), static_cast<long>(s.getVariableNames().size())));
-    t_env_state.link_transforms.erase("world");
-    t_sampled_states.push_back(t_env_state.link_transforms);
+    auto t_transforms = t_env_state.link_transforms;
+    t_transforms.erase("world");
+    t_sampled_states.push_back(t_transforms);
   }
 
   for (auto& contact_checker : contact_checkers)
